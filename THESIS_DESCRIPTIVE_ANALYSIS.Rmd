@@ -1,0 +1,536 @@
+---
+title: "Untitled"
+author: "francesco"
+date: "2024-01-23"
+output: html_document
+---
+
+Import libraries
+
+```{r}
+library(devtools)
+library(footBayes)
+library(bayesplot)
+library(loo)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+require(rstan)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(cluster)
+library(knitr)
+library(gridExtra)
+library(kableExtra)
+library(dagitty)
+set.seed(1)  
+```
+
+
+
+
+
+Create dataframe for multiple seasons (REMOTE data from footBayes library)
+```{r}
+data("italy")
+italy <- as.data.frame(italy)
+
+#italy_19_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2019", "2020", "2021"))
+#colnames(italy_19_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+italy_13_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021"))
+colnames(italy_13_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+tail(italy_13_to_21)
+
+```
+
+FILTER FOR TEAMS THAT HAVE ALWAYS BEEN ENTERED IN THE CHAMPIONSHIP IN THE SEASONS IN QUESTION
+```{r}
+# Lista univoca delle squadre presenti in ogni stagione
+squadre_presenti_in_ogni_stagione <- italy_13_to_21 %>%
+  group_by(home, away) %>%
+  filter(all(unique(italy_13_to_21$season) %in% season)) %>%
+  select(home, away) %>%
+  distinct()
+
+# Lista univoca delle squadre presenti in almeno una stagione dal dataset originale
+squadre_univoche_presenti <- unique(c(squadre_presenti_in_ogni_stagione$home, squadre_presenti_in_ogni_stagione$away))
+
+# Stampa la lista delle squadre
+print(squadre_univoche_presenti)
+
+
+```
+FILTERED DS ENRICHED (considera squadre sempre presenti nelle stagioni, e match disputati sia tra loro che con squadre non presenti in ogni stagione del ds) | la condizione di filtro � che almeno una delle due squadre (H/A) sia tra quelle sempre presenti nelle 9 stagioni del ds. 
+```{r}
+# Filtra il dataframe originale
+df_filtrato_enrich <- italy_13_to_21 %>%
+  filter(home %in% squadre_univoche_presenti | away %in% squadre_univoche_presenti)
+dim(df_filtrato_enrich)
+```
+```{r}
+# Conta il numero di partite per ogni stagione
+partite_per_stagione <- df_filtrato_enrich %>%
+  group_by(season) %>%
+  summarise(numero_partite = n())
+
+# Stampa il risultato
+print(partite_per_stagione)
+
+```
+
+
+
+
+DESCRIPTIVE ANALYSIS
+
+```{r}
+homegoals <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  summarise(
+    mean_H = mean(homegoals),
+    median_H = median(homegoals),
+    min_H = min(homegoals),
+    max_H = max(homegoals),
+    std_dev_H = sd(homegoals)
+  )
+
+cat("Statistiche descrittive per i gol in casa:\n")
+
+print(summary_homegoals)
+
+summary_awaygoals <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti) %>%
+  summarise(
+    mean_A = mean(awaygoals),
+    median_A = median(awaygoals),
+    min_A = min(awaygoals),
+    max_A = max(awaygoals),
+    std_dev_A = sd(awaygoals)
+  )
+
+print(summary_awaygoals)
+```
+
+
+
+```{r}
+library(ggplot2)
+
+# Imposta la larghezza desiderata del dispositivo di output (in pollici)
+options(repr.plot.width = 30)  # Imposta a 10 pollici, puoi regolare questo valore
+
+# Assuming df_filtrato_enrich is your data frame
+
+# Filter and create boxplot for home goals
+plot_home <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  ggplot(aes(x = 1, y = homegoals, fill = "Home")) +
+  geom_boxplot() +
+  labs(title = "Home Goals") +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    legend.position = "none"
+  ) +
+  scale_fill_manual(values = c("Home" = "red"))
+
+# Filter and create boxplot for away goals
+plot_away <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti) %>%
+  ggplot(aes(x = 1, y = awaygoals, fill = "Away")) +
+  geom_boxplot() +
+  labs(title = "Away Goals") +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    legend.position = "none"
+  ) +
+  scale_fill_manual(values = c("Away" = "deepskyblue1"))
+
+# Combine the two plots side by side
+library(gridExtra)
+
+
+```
+
+
+
+```{r}
+homegoals_DS <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti)
+
+awaygoals_DS <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti)
+
+
+
+```
+```{r}
+merged_df <- rbind(
+  mutate(homegoals_DS, location = "homegoals"),
+  mutate(awaygoals_DS, location = "awaygoals")
+)
+
+# Crea il boxplot
+p <- ggplot(merged_df, aes(x = location, y = homegoals, fill = location)) +
+  geom_boxplot() +
+  labs(title = "Boxplot for homegoals and awaygoals",
+       y = "Goals",
+       x = NULL) +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),  # Sfondo dell'intero grafico
+    panel.background = element_rect(fill = "white"),  # Sfondo del pannello
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/merged_boxplot.png", width = 8, height = 6, dpi = 300)
+
+
+```
+
+```{r}
+summary(homegoals_DS$homegoals)
+summary(awaygoals_DS$awaygoals)
+
+```
+
+
+```{r}
+
+# Boxplot per i gol in casa
+gg_homegoals <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  ggplot(aes(x = 1, y = homegoals, fill = "Home")) +
+  geom_boxplot(alpha = 0.7, color = "black", fill = "red") +
+  labs(title = "Boxplot home goal scored", y = "Home goals") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white"))  # Imposta il colore di sfondo
+
+# Boxplot per i gol fuori casa
+gg_awaygoals <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti) %>%
+  ggplot(aes(x = 1, y = awaygoals, fill = "Away")) +
+  geom_boxplot(alpha = 0.7, color = "black", fill = "deepskyblue1") +
+  labs(title = "Boxplot away goal scored", y = "Away goals") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white"))  # Imposta il colore di sfondo
+
+# Combinare i due boxplot in un unico grafic
+
+
+```
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Assuming df_filtrato_enrich contains your data
+df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti | away %in% squadre_univoche_presenti) %>%
+  ggplot(aes(x = factor(1), y = ifelse(!is.na(homegoals), homegoals, awaygoals), fill = factor(ifelse(!is.na(homegoals), "Home", "Away")))) +
+  geom_boxplot(alpha = 0.7, color = "black", position = position_dodge(width = 0.75)) +
+  labs(title = "Boxplot of Home and Away Goals Scored", y = "Goals") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white"))
+
+
+```
+
+
+
+
+```{r}
+data <- data.frame(df_filtrato_enrich$homegoals, df_filtrato_enrich$awaygoals)
+data_long <- reshape2::melt(data)
+
+# Usa ggplot2 per creare il grafico con faceting
+ggplot(data_long, aes(x = value, fill = variable)) +
+  geom_histogram(binwidth = 1, position = position_dodge(width = 0.7), alpha = 0.7) +
+  labs(title = "Home and Away goals distribution",
+       x = "Number of goals",
+       y = "Frequency") +
+  scale_fill_manual(values = c("red", "deepskyblue1"),
+                    name = "Legend",  # Specifica il nome della legenda
+                    labels = c("Home goals", "Away goals")) +
+  theme_minimal()
+
+
+```
+
+
+
+
+
+
+DIFFERENZA TRA GOL FATTI IN CASA E FUORI CASA PER IL SINGOLO TEAM, RAGGRUPPATO PER STAGIONE. 
+```{r}
+# Somma dei gol fatti in casa e fuori casa, e differenza, raggruppate per stagione e filtro per squadre_univoche_presenti
+home_goals_team <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  group_by(season, team = home) %>%
+  summarise(homegoals = sum(homegoals))
+
+# Creazione di un dataframe con la somma dei gol fatti fuori casa per ogni squadra e stagione
+away_goals_team <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti) %>%
+  group_by(season, team = away) %>%
+  summarise(awaygoals = sum(awaygoals))
+
+home_away_diff <- merge(home_goals_team, away_goals_team, by = c("season", "team"))
+
+home_away_diff <- home_away_diff %>%
+  mutate(diff_goals = home_goals_team$homegoals - away_goals_team$awaygoals)
+
+print(home_away_diff)
+
+
+```
+
+
+
+
+
+
+
+```{r}
+# Usa una scala di colori predefinita più distinta
+ggplot(home_away_diff, aes(x = factor(season), y = diff_goals, group = team, color = team)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +   
+  labs(title = "",
+       x = "Season",
+       y = "Difference") +
+  scale_color_discrete() +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white"),  # Imposta il colore di sfondo dell'intero grafico
+        panel.background = element_rect(fill = "white"),  # Imposta il colore di sfondo del pannello
+        legend.position = "top",
+        legend.background = element_rect(fill = "white"),  # Imposta il colore di sfondo della leggenda
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/diff_GH_GA.png", width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# Conta il numero di valori negativi e maggiori o uguali a zero nella colonna diff_goals
+count_diff_goals <- home_away_diff %>%
+  summarise(negative_count = sum(diff_goals < 0),
+            non_negative_count = sum(diff_goals >= 0))
+
+count_diff_goals
+
+```
+
+```{r}
+# Calcola le percentuali richieste per ogni squadra e stagione
+home_away_diff_percentages <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  group_by(season, team=home) %>%
+  summarise(
+    percentage_grater = mean(homegoals > awaygoals) * 100,
+    percentage_grater_equal = mean(homegoals >= awaygoals) * 100,
+    percentage_smaller = mean(homegoals < awaygoals) * 100
+  )
+
+# Stampa il DataFrame risultante
+print(home_away_diff_percentages)
+
+
+
+```
+
+
+
+
+---------------------------------------------------
+GOL FATTI VS GOL SUBITI DAL TEAM IN CASA. 
+```{r}
+# Creazione di un dataframe con la differenza tra i gol fatti e i gol subiti in casa per ogni squadra e stagione
+diff_gol_FS_H <- df_filtrato_enrich %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  group_by(season, home) %>%
+  summarise(differenza_gol_casa = sum(homegoals) - sum(awaygoals))
+
+# Visualizza il risultato
+print(diff_gol_FS_H)
+
+```
+
+
+```{r}
+# Creazione di un dataframe con la differenza tra i gol fatti e i gol subiti fuori casa per ogni squadra e stagione
+diff_gol_FS_A <- df_filtrato_enrich %>%
+  filter(away %in% squadre_univoche_presenti) %>%
+  group_by(season, away) %>%
+  summarise(differenza_gol_fuori_casa = sum(awaygoals) - sum(homegoals))
+
+# Visualizza il risultato
+print(diff_gol_FS_A)
+
+```
+
+
+
+
+```{r}
+# Creazione del plot con ggplot2 per i nuovi dati diff_gol_FS
+library(ggplot2)
+
+# Creazione del plot per i gol in casa
+plot_home <- ggplot(diff_gol_FS_H, aes(x = factor(season), y = differenza_gol_casa, group = home, color = home)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Home goals scored - Home goals conceded | per season",
+       x = "Season",
+       y = "Difference") +
+  theme_bw() +  
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_rect(fill = "white"),  # Sfondo del grafico
+        legend.background = element_rect(fill = "white"))  # Sfondo della legenda
+
+
+# Creazione del plot per i gol fuori casa
+plot_away <- ggplot(diff_gol_FS_A, aes(x = factor(season), y = differenza_gol_fuori_casa, group = away, color = away)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Away goals scored - Away goals conceded | per season",
+       x = "Season",
+       y = "Difference") +
+  theme_bw() +  
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.background = element_rect(fill = "white"),  # Sfondo del grafico
+        legend.background = element_rect(fill = "white"))  # Sfondo della legenda
+
+
+
+
+
+
+
+```
+
+
+
+
+
+```{r}
+# Per il plot dei gol in casa
+summary_home <- diff_gol_FS_H %>%
+  group_by(season) %>%
+  summarise(above_zero = sum(differenza_gol_casa >= 0),
+            below_zero = sum(differenza_gol_casa < 0))
+
+# Per il plot dei gol fuori casa
+summary_away <- diff_gol_FS_A %>%
+  group_by(season) %>%
+  summarise(above_zero = sum(differenza_gol_fuori_casa >= 0),
+            below_zero = sum(differenza_gol_fuori_casa < 0))
+
+# Stampa dei risultati
+print("Per il plot dei gol in casa:")
+print(sum(summary_home$above_zero))
+print(sum(summary_home$below_zero))
+
+print("Per il plot dei gol fuori casa:")
+print(sum(summary_away$above_zero))
+print(sum(summary_away$below_zero))
+
+```
+
+
+
+```{r}
+# Calcolo delle volte in cui il numero di gol fatti in casa è maggiore del numero di gol fatti dalla squadra ospite
+df_greater <- df_filtrato_enrich %>%
+  group_by(season, home, away) %>%
+  summarise(times_greater = sum(homegoals > awaygoals))
+
+# Calcolo delle volte in cui il numero di gol fatti in casa è maggiore o uguale al numero di gol fatti dalla squadra ospite
+df_greater_equal <- df_filtrato_enrich %>%
+  group_by(season, home, away) %>%
+  summarise(times_greater_equal = sum(homegoals >= awaygoals))
+
+# Calcolo delle volte in cui il numero di gol fatti in casa è minore del numero di gol fatti dalla squadra ospite
+df_smaller <- df_filtrato_enrich %>%
+  group_by(season, home, away) %>%
+  summarise(times_smaller = sum(homegoals < awaygoals))
+
+# Unisci i dataframe
+df_result <- inner_join(df_greater, df_greater_equal, by = c("season", "home", "away")) %>%
+  inner_join(df_smaller, by = c("season", "home", "away"))
+
+# Calcolo della percentuale rispetto al totale delle partite giocate in casa per ogni stagione
+df_result <- df_result %>%
+  filter(home %in% squadre_univoche_presenti) %>%
+  group_by(season, home) %>%
+  summarise(
+    total_home_matches = n(),
+    percentage_greater = mean(times_greater > 0) * 100,
+    percentage_greater_equal = mean(times_greater_equal > 0) * 100,
+    percentage_smaller = mean(times_smaller > 0) * 100
+  )
+
+# Visualizzazione dei risultati
+print(df_result)
+
+
+```
+
+```{r}
+
+ggplot(df_result, aes(x = as.factor(season), y = home, fill = percentage_greater)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Heatmap of Percentage Greater for Each Team and Season",
+       x = "Season",
+       y = "Team",
+       fill = "Percentage Greater") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+
+
+ggplot(df_result, aes(x = as.factor(season), y = home, fill = percentage_greater_equal)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Heatmap of Percentage Greater or equal for Each Team and Season",
+       x = "Season",
+       y = "Team",
+       fill = "Percentage Greater or equal") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+
+ggplot(df_result, aes(x = as.factor(season), y = home, fill = percentage_smaller)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Heatmap of Percentage smaller for Each Team and Season",
+       x = "Season",
+       y = "Team",
+       fill = "Percentage smaller") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+
+```
+
+
+
+

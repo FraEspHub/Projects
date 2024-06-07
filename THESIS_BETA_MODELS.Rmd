@@ -1,0 +1,714 @@
+---
+title: "Untitled"
+author: "francesco"
+date: "2024-01-09"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Import libraries
+
+```{r}
+library(devtools)
+library(footBayes)
+library(bayesplot)
+library(loo)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+require(rstan)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(cluster)
+library(knitr)
+library(kableExtra)
+library(dagitty)
+set.seed(1)  
+```
+
+
+
+
+
+Create dataframe for multiple seasons (REMOTE data from footBayes library)
+```{r}
+data("italy")
+italy <- as.data.frame(italy)
+
+#italy_19_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2019", "2020", "2021"))
+#colnames(italy_19_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+italy_13_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021"))
+colnames(italy_13_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+head(italy_13_to_21)
+
+```
+
+
+#########################################################################################################################################################################################
+#########################################################################################################################################################################################
+
+"data_definition" function -> returns the data needed for the STAN model
+```{r}
+
+data_definition_beta <- function(data,
+                      predict){
+#DATA CHECK
+ if (!is.matrix(data) & !is.data.frame(data)){
+    stop("Data are not stored in matrix/data frame
+         structure.")
+  }
+  
+  if (dim(data)[2]<5){
+    stop("Data dimensions are wrong! Supply a matrix/data frame containing the following mandatory column items:
+         season, home team, away team, home goals, away goals.")
+  }
+
+  if ( !is.numeric(data$homegoals) |!is.numeric(data$awaygoals)){
+    stop("Goals are not numeric!")
+  }
+
+  if (dim(data)[2]>5){
+    warning("Dataset too large! The function will evaluate the first five columns as follows: season, home team, away team, home goals, away goals")
+  }
+  
+  colnames(data) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+   
+#PREDICT CHECK
+  if (predict == 0){
+    predict = 0
+	  ngames = dim(data)[1]
+	  nfit = ngames
+	  npred = predict
+  }else if(is.numeric(predict)){
+    ngames = dim(data)[1]
+    nfit = ngames-predict
+    npred = predict
+  }
+  
+  
+#DATA FOR STAN MODEL
+  nteams = length(unique(data$home))     #number of teams
+  teams = unique(data$home)              #unique team names
+  home = match(data$home, teams)         #team home (indexes of the whole ngames)
+  away = match(data$away, teams)         #team away (indexes of the whole ngames)
+  team1 = home[1:nfit]                   #idx home extraction for the first nfirst matches (total - predicted)
+  team2 = away[1:nfit]                   #idx away extraction for the first nfirst matches (total - predicted)
+  score1 = data$homegoals[1:nfit]        #score home team
+  score2 = data$awaygoals[1:nfit]        #score away team
+  team1pred = home[(nfit+1):(ngames)]    #home prev  || ngames = nfit + nprev
+  team2pred = away[(nfit+1):(ngames)]    #away prev  || ngames = nfit + nprev
+  diff_score = score1 - score2           #diff for Skellam
+  
+
+  
+
+  data_stan = list(
+    nteams = nteams,          
+    teams = teams,
+    home = home,
+    away = away,
+    team1 = team1,        
+    team2 = team2,        
+    team1pred = team1pred,    
+    team2pred = team2pred,    
+    score1 = score1,
+    score2 = score2,
+    diff_score = (score1-score2),
+    ngames = ngames,
+    nfit = nfit,
+    npred = npred)
+    
+  return(data_stan)
+}
+```
+
+Recall data_definition function providing a dataset and the number of games to predict as argument. 
+```{r}
+up_data_beta = data_definition_beta(italy_13_to_21, 5)
+```
+
+
+STAN model definition | Beta sparse (0.001, 0.001) 
+```{r}
+poiss_beta_expl_NI <- "
+data {
+  int<lower=0> nteams; //number of teams
+  int<lower=0> ngames; //number of games (all)
+  int<lower=0> nfit;   //number of games (for train -- [total - predict]) 
+  int<lower=0> team1[nfit]; //home team index
+  int<lower=0> team2[nfit]; //away team index
+  int<lower=0> score1[nfit]; //score home team
+  int<lower=0> score2[nfit]; //score away team
+  int<lower=0> npred; //number of predicted games
+  int<lower=0> team1pred[npred]; //home team index for prediction
+  int<lower=0> team2pred[npred]; //away team index for prediction
+}
+
+parameters {
+  vector<lower=0, upper=1>[nteams] att; //attack ability of each team
+  vector<lower=0, upper=1>[nteams] def; //defence ability of each team
+  real<lower=0, upper=1> home; //home advantage
+  
+  //hyper parameters
+  //real<lower=0> alpha_att;
+  //real<lower=0> alpha_def;
+  //real<lower=0> beta_att;
+  //real<lower=0> beta_def;
+}
+
+transformed parameters {
+  //vector[nteams] att; 
+  //vector[nteams] def; 
+  vector[nfit] theta1; //score intensity of home team   | test con vector[nfit] per non ottenere elementi vuoti
+  vector[nfit] theta2; //score intensity of away team   | test con vector[nfit] per non ottenere elementi vuoti
+
+  //for (t in 1:nteams){
+    //att[t] = att_raw[t];  //-mean(att_raw);
+    //def[t] = def_raw[t];  //-mean(def_raw);
+  //}
+
+  theta1 = exp(home + att[team1] - def[team2]);
+  theta2 = exp(att[team2] - def[team1]);
+}
+
+model {
+  // priors
+  for (t in 1:nteams) {
+    att[t] ~ beta(0.001, 0.001);
+    def[t] ~ beta(0.001, 0.001);
+  }
+
+  home ~ beta(1, 1);  
+
+  // hyper-priors
+  //alpha_att ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //alpha_def ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  //beta_att ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //beta_def ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  // likelihood
+  score1 ~ poisson(theta1);
+  score2 ~ poisson(theta2);
+}
+
+
+generated quantities {
+//generate predictions
+  //real s1rep[nfit]; //replicated score //in-sample
+  //real s2rep[nfit]; //replicated score //in-sample
+  real s1pred[npred]; //predicted score //o-o-sample
+  real s2pred[npred]; //predicted score //o-o-sample
+  vector[npred] theta1pred; //score probability of home team //o-o-sample
+  vector[npred] theta2pred; //score probability of away team //o-o-sample
+
+  //s1rep = poisson_rng(theta1);  //in-sample
+  //s2rep = poisson_rng(theta2);  //in-sample
+
+  theta1pred = exp(home + att[team1pred] - def[team2pred]); //o-o-sample
+  theta2pred = exp(att[team2pred] - def[team1pred]); //o-o-sample
+   
+  s1pred = poisson_rng(theta1pred);  //o-o-sample
+  s2pred = poisson_rng(theta2pred);  //o-o-sample
+  
+}
+"
+
+```
+
+STAN model definition | Beta (1, 1)
+```{r}
+poiss_beta_expl <- "
+data {
+  int<lower=0> nteams; //number of teams
+  int<lower=0> ngames; //number of games (all)
+  int<lower=0> nfit;   //number of games (for train -- [total - predict]) 
+  int<lower=0> team1[nfit]; //home team index
+  int<lower=0> team2[nfit]; //away team index
+  int<lower=0> score1[nfit]; //score home team
+  int<lower=0> score2[nfit]; //score away team
+  int<lower=0> npred; //number of predicted games
+  int<lower=0> team1pred[npred]; //home team index for prediction
+  int<lower=0> team2pred[npred]; //away team index for prediction
+}
+
+parameters {
+  vector<lower=0, upper=1>[nteams] att; //attack ability of each team
+  vector<lower=0, upper=1>[nteams] def; //defence ability of each team
+  real<lower=0, upper=1> home; //home advantage
+  
+  //hyper parameters
+  //real<lower=0> alpha_att;
+  //real<lower=0> alpha_def;
+  //real<lower=0> beta_att;
+  //real<lower=0> beta_def;
+}
+
+transformed parameters {
+  //vector[nteams] att; 
+  //vector[nteams] def; 
+  vector[nfit] theta1; //score intensity of home team   | test con vector[nfit] per non ottenere elementi vuoti
+  vector[nfit] theta2; //score intensity of away team   | test con vector[nfit] per non ottenere elementi vuoti
+
+  //for (t in 1:nteams){
+    //att[t] = att_raw[t];  //-mean(att_raw);
+    //def[t] = def_raw[t];  //-mean(def_raw);
+  //}
+
+  theta1 = exp(home + att[team1] - def[team2]);
+  theta2 = exp(att[team2] - def[team1]);
+}
+
+model {
+  // priors
+  for (t in 1:nteams) {
+    att[t] ~ beta(1, 1);
+    def[t] ~ beta(1, 1);
+  }
+
+  home ~ beta(1, 1);  
+
+  // hyper-priors
+  //alpha_att ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //alpha_def ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  //beta_att ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //beta_def ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  // likelihood
+  score1 ~ poisson(theta1);
+  score2 ~ poisson(theta2);
+}
+
+
+generated quantities {
+//generate predictions
+  //real s1rep[nfit]; //replicated score //in-sample
+  //real s2rep[nfit]; //replicated score //in-sample
+  real s1pred[npred]; //predicted score //o-o-sample
+  real s2pred[npred]; //predicted score //o-o-sample
+  vector[npred] theta1pred; //score probability of home team //o-o-sample
+  vector[npred] theta2pred; //score probability of away team //o-o-sample
+
+  //s1rep = poisson_rng(theta1);  //in-sample
+  //s2rep = poisson_rng(theta2);  //in-sample
+
+  theta1pred = exp(home + att[team1pred] - def[team2pred]); //o-o-sample
+  theta2pred = exp(att[team2pred] - def[team1pred]); //o-o-sample
+   
+  s1pred = poisson_rng(theta1pred);  //o-o-sample
+  s2pred = poisson_rng(theta2pred);  //o-o-sample
+  
+}
+"
+```
+
+STAN model definition | Beta informative ( 5, 5)
+```{r}
+poiss_beta_expl_I <- "
+data {
+  int<lower=0> nteams; //number of teams
+  int<lower=0> ngames; //number of games (all)
+  int<lower=0> nfit;   //number of games (for train -- [total - predict]) 
+  int<lower=0> team1[nfit]; //home team index
+  int<lower=0> team2[nfit]; //away team index
+  int<lower=0> score1[nfit]; //score home team
+  int<lower=0> score2[nfit]; //score away team
+  int<lower=0> npred; //number of predicted games
+  int<lower=0> team1pred[npred]; //home team index for prediction
+  int<lower=0> team2pred[npred]; //away team index for prediction
+}
+
+parameters {
+  vector<lower=0, upper=1>[nteams] att; //attack ability of each team
+  vector<lower=0, upper=1>[nteams] def; //defence ability of each team
+  real<lower=0, upper=1> home; //home advantage
+  
+  //hyper parameters
+  //real<lower=0> alpha_att;
+  //real<lower=0> alpha_def;
+  //real<lower=0> beta_att;
+  //real<lower=0> beta_def;
+}
+
+transformed parameters {
+  //vector[nteams] att; 
+  //vector[nteams] def; 
+  vector[nfit] theta1; //score intensity of home team   | test con vector[nfit] per non ottenere elementi vuoti
+  vector[nfit] theta2; //score intensity of away team   | test con vector[nfit] per non ottenere elementi vuoti
+
+  //for (t in 1:nteams){
+    //att[t] = att_raw[t];  //-mean(att_raw);
+    //def[t] = def_raw[t];  //-mean(def_raw);
+  //}
+
+  theta1 = exp(home + att[team1] - def[team2]);
+  theta2 = exp(att[team2] - def[team1]);
+}
+
+model {
+  // priors
+  for (t in 1:nteams) {
+    att[t] ~ beta(5, 5);
+    def[t] ~ beta(5, 5);
+  }
+
+  home ~ beta(1, 1);  
+
+  // hyper-priors
+  //alpha_att ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //alpha_def ~ beta(0.1, 0.1);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  //beta_att ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  //beta_def ~ beta(0.1, 0.1);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  // likelihood
+  score1 ~ poisson(theta1);
+  score2 ~ poisson(theta2);
+}
+
+
+generated quantities {
+//generate predictions
+  //real s1rep[nfit]; //replicated score //in-sample
+  //real s2rep[nfit]; //replicated score //in-sample
+  real s1pred[npred]; //predicted score //o-o-sample
+  real s2pred[npred]; //predicted score //o-o-sample
+  vector[npred] theta1pred; //score probability of home team //o-o-sample
+  vector[npred] theta2pred; //score probability of away team //o-o-sample
+
+  //s1rep = poisson_rng(theta1);  //in-sample
+  //s2rep = poisson_rng(theta2);  //in-sample
+
+  theta1pred = exp(home + att[team1pred] - def[team2pred]); //o-o-sample
+  theta2pred = exp(att[team2pred] - def[team1pred]); //o-o-sample
+   
+  s1pred = poisson_rng(theta1pred);  //o-o-sample
+  s2pred = poisson_rng(theta2pred);  //o-o-sample
+  
+}
+"
+```
+
+STAN model definition | Beta Beta (0.001, 0.001) 
+```{r}
+poiss_beta_beta <- "
+data {
+  int<lower=0> nteams; //number of teams
+  int<lower=0> ngames; //number of games (all)
+  int<lower=0> nfit;   //number of games (for train -- [total - predict]) 
+  int<lower=0> team1[nfit]; //home team index
+  int<lower=0> team2[nfit]; //away team index
+  int<lower=0> score1[nfit]; //score home team
+  int<lower=0> score2[nfit]; //score away team
+  int<lower=0> npred; //number of predicted games
+  int<lower=0> team1pred[npred]; //home team index for prediction
+  int<lower=0> team2pred[npred]; //away team index for prediction
+}
+
+parameters {
+  vector<lower=0, upper=1>[nteams] att; //attack ability of each team
+  vector<lower=0, upper=1>[nteams] def; //defence ability of each team
+  real<lower=0, upper=1> home; //home advantage
+  
+  //hyper parameters
+  real<lower=0, upper=1> alpha_att;
+  real<lower=0, upper=1> alpha_def;
+  real<lower=0, upper=1> beta_att;
+  real<lower=0, upper=1> beta_def;
+}
+
+transformed parameters {
+  //vector[nteams] att; 
+  //vector[nteams] def; 
+  vector[nfit] theta1; //score intensity of home team   | test con vector[nfit] per non ottenere elementi vuoti
+  vector[nfit] theta2; //score intensity of away team   | test con vector[nfit] per non ottenere elementi vuoti
+
+  theta1 = exp(home + att[team1] - def[team2]);
+  theta2 = exp(att[team2] - def[team1]);
+}
+
+model {
+  // priors
+  for (t in 1:nteams) {
+    att[t] ~ beta(alpha_att, beta_att);
+    def[t] ~ beta(alpha_def, beta_def);
+  }
+
+  home ~ beta(1, 1);  
+
+// hyper-priors
+  alpha_att ~ beta(0.001, 0.001);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  alpha_def ~ beta(0.001, 0.001);   // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  beta_att ~ beta(0.001, 0.001);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+  beta_def ~ beta(0.001, 0.001);    // (0.5, 0.5) | (1, 1) NON-INFORMATIVE |(2, 2) (10, 10) #INFORMATIVE
+
+  // likelihood
+  score1 ~ poisson(theta1);
+  score2 ~ poisson(theta2);
+}
+
+
+generated quantities {
+//generate predictions
+  //real s1rep[nfit]; //replicated score //in-sample
+  //real s2rep[nfit]; //replicated score //in-sample
+  real s1pred[npred]; //predicted score //o-o-sample
+  real s2pred[npred]; //predicted score //o-o-sample
+  vector[npred] theta1pred; //score probability of home team //o-o-sample
+  vector[npred] theta2pred; //score probability of away team //o-o-sample
+
+  //s1rep = poisson_rng(theta1);  //in-sample
+  //s2rep = poisson_rng(theta2);  //in-sample
+
+  theta1pred = exp(home + att[team1pred] - def[team2pred]); //o-o-sample
+  theta2pred = exp(att[team2pred] - def[team1pred]); //o-o-sample
+   
+  s1pred = poisson_rng(theta1pred);  //o-o-sample
+  s2pred = poisson_rng(theta2pred);  //o-o-sample
+  
+}
+"
+
+```
+
+
+
+Run of the model
+```{r}
+writeLines(poiss_beta_expl_I, "poiss_beta_expl_I.stan")
+first_model_beta = stan(file ="poiss_beta_expl_I.stan",  data = up_data_beta, verbose = FALSE)
+```
+
+
+Model parameters extraction
+```{r}
+model_param_beta = rstan::extract(first_model_beta)
+```
+
+
+```{r}
+plot(model_param$home)
+plot(model_param_beta$home)
+
+# Crea un dataframe con i dati
+data_boxplot <- data.frame(
+  Method = rep(c("GP model", "Beta model"), each = length(model_param$home)),
+  Values = c(model_param$home, model_param_beta$home)
+)
+
+
+ggplot(data_boxplot, aes(x = Method, y = Values, fill = Method)) +
+  geom_boxplot() +
+  labs(title = "Boxplot Home parameter",
+       x = "Models",
+       y = "Values") +
+  scale_fill_manual(values = c("GP model" = "lightgreen", "Beta model" = "orange"))
+
+  
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/boxplot_home_twomodels.png", width = 8, height = 6, dpi = 300)
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+
+# Assuming plot_data is your vector of data
+home_data <- model_param_beta$home
+
+# Create the boxplot
+boxplot <- ggplot(data.frame(value = home_data), aes(y = value)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  labs(title = "Boxplot of Home Parameter (Beta(1, 1))", y = "Home Parameter") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white"),  # Set background color
+    plot.background = element_rect(fill = "white"),   # Set plot background color
+    panel.grid.major = element_line(color = "gray", linetype = "dashed"),  # Add grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    axis.line = element_line(color = "black"),  # Set axis line color
+    text = element_text(color = "black")  # Set text color
+  )
+
+# Save the boxplot
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/home_boxplot_Beta_1_1.png", boxplot, width = 8, height = 6, dpi = 300)
+
+
+```
+
+
+
+Plot for predicted games
+```{r}
+pred_scores = c(colMeans(model_param$s1pred),colMeans(model_param$s2pred)) 
+#true_scores = c(italy_13_to_21$homegoals[(up_data$nfit+1):up_data$ngames],italy_13_to_21$awaygoals[(up_data$nfit+1):up_data$ngames])
+true_scores = c(italy_13_to_21$homegoals[(up_data$nfit+1):up_data$ngames],italy_13_to_21$awaygoals[(up_data$nfit+1):up_data$ngames])
+plot(true_scores, pred_scores, xlim=c(0,5), ylim=c(0,5), pch=20, ylab='predicted scores', xlab='true scores')
+abline(a=0,  b=1, lty='dashed')
+
+pred_errors = c(sapply(1:up_data$npred, function(x) sd(model_param$s1pred[,x])),sapply(1:up_data$npred, function(x) sd(model_param$s2pred[,x])))
+arrows(true_scores, pred_scores+pred_errors, true_scores, pred_scores-pred_errors, length = 0.05, angle = 90, code = 3, col=rgb(0,0,0,0.3))
+```
+
+
+Season target definition -> returns the names of the teams participating in Serie A in the season of interest.
+```{r}
+#unique_ss <- unique(subset(italy_13_to_21$home, italy_13_to_21$season == "2021"))
+unique_ss <- unique(subset(italy_13_to_21$home, italy_13_to_21$season == "2021"))
+
+```
+
+
+Plot for the att - def capability of the teams
+
+```{r}
+# attacchi e le difese come media e deviazione standard
+attack <- colMeans(model_param_beta$att)
+attacksd <- sapply(1:up_data_beta$nteams, function(x) sd(model_param_beta$att[, x]))
+defense <- colMeans(model_param_beta$def)
+defensesd <- sapply(1:up_data_beta$nteams, function(x) sd(model_param_beta$def[, x]))
+
+# filtro gli attacchi e le difese solo per le squadre in unique_ss
+filtered_attack <- attack[up_data_beta$teams %in% unique_ss]
+filtered_defense <- defense[up_data_beta$teams %in% unique_ss]
+filtered_attacksd <- attacksd[up_data_beta$teams %in% unique_ss]
+filtered_defensesd <- defensesd[up_data_beta$teams %in% unique_ss]
+
+data <- data.frame(
+  Attack = filtered_attack,
+  Defense = filtered_defense,
+  Team = up_data_beta$teams[up_data_beta$teams %in% unique_ss]
+)
+
+```
+
+```{r}
+# ggplot2 e ggrepel
+library(ggplot2)
+library(ggrepel)
+
+# Create a data frame with mean and standard deviation values
+data <- data.frame(
+  Attack = filtered_attack,
+  Defense = filtered_defense,
+  attacksd = filtered_attacksd,
+  defensesd = filtered_defensesd,
+  Team = up_data_beta$teams[up_data_beta$teams %in% unique_ss]
+)
+```
+
+
+
+```{r}
+k <- 4
+
+# Perform K-means clustering
+set.seed(123)  # Set seed for reproducibility
+data$cluster <- kmeans(data[, c("Defense", "Attack")], centers = k)$cluster
+
+# Create a ggplot scatter plot
+p <- ggplot(data, aes(x = Defense, y = Attack, label = Team, color = factor(cluster))) +
+  labs(x = "Defense", y = "Attack", title = "Attack & Defense") +
+  
+  # Add arrows for standard deviations
+  geom_errorbar(aes(x = Defense, ymin = Attack - attacksd, ymax = Attack + attacksd), width = 0, linetype = "dashed",  color = "darkgrey", alpha = 0.5) +
+  geom_errorbarh(aes(y = Attack, xmin = Defense - defensesd, xmax = Defense + defensesd), height = 0, linetype = "dashed", color = "darkgrey", alpha = 0.5) +
+  
+  # Add labels with repel to avoid overlapping
+  geom_text_repel(aes(color = factor(cluster)), box.padding = 0.63, size = 3, max.overlaps = Inf, color = "black") +  # Adjust 'size' and 'max.overlaps' as needed
+  geom_point(size = 3.5, alpha = 0.7) +  # Adjust 'size' and 'alpha' as needed
+
+  # Set theme with a white background
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white")
+  ) +
+  
+  # Add cluster colors
+  scale_color_manual(name = "Cluster", values = c("red", "blue", "green", "orange")) +
+  
+  # Add dashed line at x = 0.5 and y = 0.5
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "black") +
+  
+  # Set X and Y axis limits
+  xlim(0, 1) +
+  ylim(0, 1)
+
+
+
+print(p)
+
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/Beta_final_model_2021.png", width = 8, height = 6, dpi = 300)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+Testing different distances between coordinates of each point in order to have an overall ranking  
+
+```{r}
+# Euclidean: radice quadrata della somma dei quadrati delle differenze tra le coordinate dei punti
+euclidean_distance <- sqrt(filtered_attack^2 + filtered_defense^2)
+
+# Manhattan: somma delle differenze assolute tra le coordinate dei punti
+manhattan_distance <- abs(filtered_attack - 0) + abs(filtered_defense - 0)
+
+```
+
+```{r}
+# Creazione del dataframe
+distance_euc <- data.frame(
+  Team = up_data$teams[up_data$teams %in% unique_ss],
+  Euclidean = euclidean_distance
+)
+
+# Creazione del dataframe
+distance_man <- data.frame(
+  Team = up_data$teams[up_data$teams %in% unique_ss],
+  Manhattan = manhattan_distance
+)
+
+
+# Ordina il dataframe in base alla colonna Euclidean in ordine decrescente
+distance_euc <- arrange(distance_euc, desc(Euclidean))
+distance_man <- arrange(distance_man, desc(Manhattan))
+
+
+# Stampa del dataframe ordinato
+print(distance_euc)
+print(distance_man)
+
+```
+
+Viewing in the same dataframe
+```{r}
+# Combinazione dei dataframe mantenendo solo le colonne necessarie
+distance_combined <- merge(distance_euc, distance_man, by = "Team")[c("Team", "Euclidean", "Manhattan")]
+
+# Ordina il dataframe combinato in base alla colonna Euclidean in ordine decrescente
+distance_combined <- arrange(distance_combined, desc(Euclidean))
+
+# Stampa del dataframe combinato ordinato con stile
+show(distance_combined)
+```

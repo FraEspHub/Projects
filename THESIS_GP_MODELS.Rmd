@@ -1,0 +1,932 @@
+---
+title: "Untitled"
+author: "francesco"
+date: "2024-01-23"
+output: html_document
+---
+
+---
+title: "GP_CODE.Rmd"
+author: "francesco"
+date: "2024-01-23"
+output: html_document
+---
+
+Import libraries
+
+```{r}
+library(devtools)
+library(footBayes)
+library(bayesplot)
+library(loo)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(rstan)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(cluster)
+library(knitr)
+library(kableExtra)
+library(dagitty)
+library(ggdist)
+library(tidyr)
+set.seed(1)  
+```
+
+Create dataframe for multiple seasons (REMOTE data from footBayes library)
+
+```{r}
+data("italy")
+italy <- as.data.frame(italy)
+
+#italy_19_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2019", "2020", "2021"))
+#colnames(italy_19_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+italy_13_to_21 <- subset(italy[, c(2, 3, 4, 6, 7)], Season %in% c("2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021"))
+colnames(italy_13_to_21) <- c("season", "home", "away", "homegoals", "awaygoals")
+head(italy_13_to_21)
+
+```
+
+"data_definition" function -\> returns the data needed for the STAN model
+
+```{r}
+
+data_definition <- function(data,
+                      predict){
+#DATA CHECK
+ if (!is.matrix(data) & !is.data.frame(data)){
+    stop("Data are not stored in matrix/data frame
+         structure.")
+  }
+  
+  if (dim(data)[2]<5){
+    stop("Data dimensions are wrong! Supply a matrix/data frame containing the following mandatory column items:
+         season, home team, away team, home goals, away goals.")
+  }
+
+  if ( !is.numeric(data$homegoals) |!is.numeric(data$awaygoals)){
+    stop("Goals are not numeric!")
+  }
+
+  if (dim(data)[2]>5){
+    warning("Dataset too large! The function will evaluate the first five columns as follows: season, home team, away team, home goals, away goals")
+  }
+  
+  colnames(data) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+   
+#PREDICT CHECK
+  if (predict == 0){
+    predict = 0
+	  ngames = dim(data)[1]
+	  nfit = ngames
+	  npred = predict
+  }else if(is.numeric(predict)){
+    ngames = dim(data)[1]
+    nfit = ngames-predict
+    npred = predict
+  }
+  
+  
+#DATA FOR STAN MODEL
+  nteams = length(unique(data$home))     #number of teams
+  teams = unique(data$home)              #unique team names
+  home = match(data$home, teams)         #team home (indexes of the whole ngames)
+  away = match(data$away, teams)         #team away (indexes of the whole ngames)
+  team1 = home[1:nfit]                   #idx home extraction for the first nfirst matches (total - predicted)
+  team2 = away[1:nfit]                   #idx away extraction for the first nfirst matches (total - predicted)
+  score1 = data$homegoals[1:nfit]        #score home team
+  score2 = data$awaygoals[1:nfit]        #score away team
+  team1pred = home[(nfit+1):(ngames)]    #home prev  || ngames = nfit + nprev
+  team2pred = away[(nfit+1):(ngames)]    #away prev  || ngames = nfit + nprev
+  diff_score = score1 - score2           #diff for Skellam
+  #data for GP 
+  seasons <- length(unique(data$season))                      #number of seasons (single number)
+  time <- seq(1, seasons)                                     #tracking time  
+  timetrack <- rep(1:seasons, each = 380)             #indicates which season each match belongs to
+
+
+  
+
+  data_stan = list(
+    nteams = nteams,          
+    teams = teams,
+    home = home,
+    away = away,
+    team1 = team1,        
+    team2 = team2,        
+    team1pred = team1pred,    
+    team2pred = team2pred,    
+    score1 = score1,
+    score2 = score2,
+    diff_score = (score1-score2),
+    ngames = ngames,
+    nfit = nfit,
+    npred = npred,
+    
+    seasons = seasons,
+    time = time,
+    timetrack = timetrack
+    )
+    
+  return(data_stan)
+}
+```
+
+
+"data_definition_PRED" function -\> returns the data needed for the STAN model
+
+```{r}
+data_definition_PRED <- function(data,
+                      predict){
+#DATA CHECK
+ if (!is.matrix(data) & !is.data.frame(data)){
+    stop("Data are not stored in matrix/data frame
+         structure.")
+  }
+  
+  if (dim(data)[2]<5){
+    stop("Data dimensions are wrong! Supply a matrix/data frame containing the following mandatory column items:
+         season, home team, away team, home goals, away goals.")
+  }
+
+  if ( !is.numeric(data$homegoals) |!is.numeric(data$awaygoals)){
+    stop("Goals are not numeric!")
+  }
+
+  if (dim(data)[2]>5){
+    warning("Dataset too large! The function will evaluate the first five columns as follows: season, home team, away team, home goals, away goals")
+  }
+  
+  colnames(data) <- c("season", "home", "away", "homegoals", "awaygoals")
+
+   
+#PREDICT CHECK
+  if (predict == 0){
+    predict = 0
+	  ngames = dim(data)[1]
+	  nfit = ngames
+	  npred = predict
+  }else if(is.numeric(predict)){
+    ngames = dim(data)[1]
+    nfit = ngames-predict
+    npred = predict
+  }
+  
+  
+#DATA FOR STAN MODEL
+  nteams = length(unique(data$home))     #number of teams
+  teams = unique(data$home)              #unique team names
+  home = match(data$home, teams)         #team home (indexes of the whole ngames)
+  away = match(data$away, teams)         #team away (indexes of the whole ngames)
+  team1 = home[1:nfit]                   #idx home extraction for the first nfirst matches (total - predicted)
+  team2 = away[1:nfit]                   #idx away extraction for the first nfirst matches (total - predicted)
+  score1 = data$homegoals[1:nfit]        #score home team
+  score2 = data$awaygoals[1:nfit]        #score away team
+  team1pred = home[(nfit+1):(ngames)]    #home prev  || ngames = nfit + nprev
+  team2pred = away[(nfit+1):(ngames)]    #away prev  || ngames = nfit + nprev
+  diff_score = score1 - score2           #diff for Skellam
+  #data for GP 
+  seasons <- length(unique(data$season)) + 1              #number of seasons (single number)
+  time <- seq(1, seasons)                                     #tracking time  
+  timetrack <- rep(1:seasons, each = 380)             #indicates which season each match belongs to
+
+
+  
+
+  data_stan = list(
+    nteams = nteams,          
+    teams = teams,
+    home = home,
+    away = away,
+    team1 = team1,        
+    team2 = team2,        
+    team1pred = team1pred,    
+    team2pred = team2pred,    
+    score1 = score1,
+    score2 = score2,
+    diff_score = (score1-score2),
+    ngames = ngames,
+    nfit = nfit,
+    npred = npred,
+    
+    seasons = seasons,
+    time = time,
+    timetrack = timetrack
+    )
+    
+  return(data_stan)
+}
+
+```
+
+
+
+
+Recall data_definition function providing a dataset and the number of games to predict as argument.
+
+```{r}
+up_data = data_definition(italy_13_to_21, 0)
+```
+
+GP STAN CODE
+
+```{r}
+gp_multinormal <- "
+    data{
+      int nteams;                 // number of teams
+      int ngames;                      // number of games
+      int team1[ngames];               // home team index
+      int team2[ngames];               // away team index
+      //int score[ngames,2];                 // scores
+      int score1[ngames]; //score home team
+      int score2[ngames]; //score away team
+      int seasons;                 // (numero di stagioni considerate)
+      int time[seasons];
+      int timetrack[ngames];                                                         # in input da R -->  timetrack <- rep(1:10, each = 380)
+    }
+    parameters{
+      matrix[seasons, nteams] att_raw;        // raw attack ability
+      matrix[seasons, nteams] def_raw;        // raw defense ability
+      real home;
+    }
+    transformed parameters{
+      matrix[seasons, nteams] att;            // attack abilities
+      matrix[seasons, nteams] def;            // defense abilities
+      cov_matrix[seasons] Sigma_att;          // GP attack cov. funct.   
+      cov_matrix[seasons] Sigma_def;          // GP defense cov.funct.
+      //matrix[seasons, nteams] mu_att;        // attack hyperparameter
+      //matrix[seasons, nteams] mu_def;        // defense hyperparameter
+      vector[ngames] theta_home;              // exponentiated linear pred.
+      vector[ngames] theta_away;
+      
+    // GP
+      for (i in 1:(seasons)) {
+        for (j in 1:(seasons)) {
+          //Sigma_att[i, j] = exp(-(time[i] - time[j])^2) + (i == j ? 0.000001 : 0.0);  // check valore 0.1/0.0001
+          //Sigma_def[i, j] = exp(-(time[i] - time[j])^2) + (i == j ? 0.000001 : 0.0);  // check valore 0.1/0.0001
+          Sigma_att[i, j] = exp(-0.1 * abs(time[i] - time[j])) + (i == j ? 0.01 : 0.0);
+          Sigma_def[i, j] = exp(-0.1 * abs(time[i] - time[j])) + (i == j ? 0.01 : 0.0);
+
+        }
+      }
+
+
+    // la dicitura att[t] indica operazione sulla t-esima riga | effettuando la media del valore att_raw[t], e sottraendo questo a tutti i valori della t-esima riga (quindi a tutti i valori di att delel 20 squadre nella t-esima stagione), sto introducendo la sum-to-zero per la i-esima stagione. 
+      // Sum-to-zero                          
+      att[1]=att_raw[1]-mean(att_raw[1]); 
+      def[1]=def_raw[1]-mean(def_raw[1]);
+      for (t in 2:seasons){
+        att[t]=att_raw[t]-mean(att_raw[t]);
+        def[t]=def_raw[t]-mean(def_raw[t]);
+      }
+      
+
+      for (n in 1:ngames){
+        theta_home[n] = exp(home+att[timetrack[n], team1[n]]+def[timetrack[n],team2[n]]);                //exp(home + att[del team x nella stagione x] + def[del team x nella stagione x]);                    
+        theta_away[n] = exp(att[timetrack[n], team2[n]]+def[timetrack[n], team1[n]]);                //exp(att[del team x nella stagione x] + def[del team x nella stagione x]);               
+      }
+    }    
+
+    model{
+      // priors for team abilities                             
+      for (h in 1:(nteams)){
+          att_raw[,h]~multi_normal(rep_vector(0, seasons), Sigma_att);  
+          def_raw[,h]~multi_normal(rep_vector(0, seasons), Sigma_def);
+      }
+
+      // priors fixed effects
+      home ~ normal(0, 5);
+
+      // likelihood
+      score1 ~ poisson(theta_home);
+      score2 ~ poisson(theta_away);
+
+    }
+    
+"
+
+
+
+```
+
+GP CON MATERN FUNCTION    1° trial
+```{r}
+gp_matern <- "
+
+data {
+  int nteams;                     // number of teams
+  int ngames;                     // number of games
+  int team1[ngames];               // home team index
+  int team2[ngames];               // away team index
+  int score1[ngames];              // score home team
+  int score2[ngames];              // score away team
+  int seasons;                     // number of seasons
+  int time[seasons];
+  int timetrack[ngames];
+}
+
+parameters {
+  matrix[seasons, nteams] att_raw; // raw attack ability
+  matrix[seasons, nteams] def_raw; // raw defense ability
+  real home;
+  real<lower=0> sigma_att;          // Matern 3/2 kernel parameter for attack
+  real<lower=0> length_scale_att;   // Matern 3/2 kernel parameter for attack
+  real<lower=0> sigma_def;          // Matern 3/2 kernel parameter for defense
+  real<lower=0> length_scale_def;   // Matern 3/2 kernel parameter for defense
+}
+
+transformed parameters {
+  matrix[seasons, nteams] att;     // attack abilities
+  matrix[seasons, nteams] def;     // defense abilities
+  cov_matrix[seasons] Sigma_att;   // GP attack cov. funct.   
+  cov_matrix[seasons] Sigma_def;   // GP defense cov.funct.
+  vector[ngames] theta_home;       // exponentiated linear pred.
+  vector[ngames] theta_away;
+
+  // Nuova matrice di covarianza Matérn 3/2
+  for (i in 1:seasons) {
+    for (j in 1:seasons) {
+      Sigma_att[i, j] = sigma_att^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_att) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_att);
+      Sigma_def[i, j] = sigma_def^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_def) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_def);
+    }
+  }
+
+  // Sum-to-zero                          
+  att[1] = att_raw[1] - mean(att_raw[1]); 
+  def[1] = def_raw[1] - mean(def_raw[1]);
+  for (t in 2:seasons) {
+    att[t] = att_raw[t] - mean(att_raw[t]);
+    def[t] = def_raw[t] - mean(def_raw[t]);
+  }
+
+  for (n in 1:ngames) {
+    theta_home[n] = exp(home + att[timetrack[n], team1[n]] + def[timetrack[n], team2[n]]);
+    theta_away[n] = exp(att[timetrack[n], team2[n]] + def[timetrack[n], team1[n]]);
+  }
+}
+
+model {
+  // priors for team abilities                             
+  for (h in 1:nteams) {
+    att_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_att);  
+    def_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_def);
+  }
+
+  // priors fixed effects
+  home ~ normal(0, 5);
+  sigma_att ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for attack
+  length_scale_att ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for attack
+  sigma_def ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for defense
+  length_scale_def ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for defense
+
+  // likelihood
+  score1 ~ poisson(theta_home);
+  score2 ~ poisson(theta_away);
+}
+
+"
+```
+
+
+GP CON MATERN FUNCTION    (- def)
+```{r}
+gp_matern_neg <- "
+
+data {
+  int nteams;                     // number of teams
+  int ngames;                     // number of games
+  int team1[ngames];               // home team index
+  int team2[ngames];               // away team index
+  int score1[ngames];              // score home team
+  int score2[ngames];              // score away team
+  int seasons;                     // number of seasons
+  int time[seasons];
+  int timetrack[ngames];
+}
+
+parameters {
+  matrix[seasons, nteams] att_raw; // raw attack ability
+  matrix[seasons, nteams] def_raw; // raw defense ability
+  real home;
+  real<lower=0> sigma_att;          // Matern 3/2 kernel parameter for attack
+  real<lower=0> length_scale_att;   // Matern 3/2 kernel parameter for attack
+  real<lower=0> sigma_def;          // Matern 3/2 kernel parameter for defense
+  real<lower=0> length_scale_def;   // Matern 3/2 kernel parameter for defense
+}
+
+transformed parameters {
+  matrix[seasons, nteams] att;     // attack abilities
+  matrix[seasons, nteams] def;     // defense abilities
+  cov_matrix[seasons] Sigma_att;   // GP attack cov. funct.   
+  cov_matrix[seasons] Sigma_def;   // GP defense cov.funct.
+  vector[ngames] theta_home;       // exponentiated linear pred.
+  vector[ngames] theta_away;
+
+  // Nuova matrice di covarianza Matérn 3/2
+  for (i in 1:seasons) {
+    for (j in 1:seasons) {
+      Sigma_att[i, j] = sigma_att^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_att) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_att);
+      Sigma_def[i, j] = sigma_def^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_def) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_def);
+    }
+  }
+
+  // Sum-to-zero                          
+  att[1] = att_raw[1] - mean(att_raw[1]); 
+  def[1] = def_raw[1] - mean(def_raw[1]);
+  for (t in 2:seasons) {
+    att[t] = att_raw[t] - mean(att_raw[t]);
+    def[t] = def_raw[t] - mean(def_raw[t]);
+  }
+
+  for (n in 1:ngames) {
+    theta_home[n] = exp(home + att[timetrack[n], team1[n]] - def[timetrack[n], team2[n]]);
+    theta_away[n] = exp(att[timetrack[n], team2[n]] - def[timetrack[n], team1[n]]);
+  }
+}
+
+model {
+  // priors for team abilities                             
+  for (h in 1:nteams) {
+    att_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_att);  
+    def_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_def);
+  }
+
+  // priors fixed effects
+  home ~ normal(0, 5);
+  sigma_att ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for attack
+  length_scale_att ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for attack
+  sigma_def ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for defense
+  length_scale_def ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for defense
+
+  // likelihood
+  score1 ~ poisson(theta_home);
+  score2 ~ poisson(theta_away);
+}
+
+"
+```
+
+GP CON PREDICTION
+```{r}
+gp_matern_neg_PRED <- "
+
+data {
+  int nteams;                     // number of teams
+  int ngames;                     // number of games
+  int team1[ngames];               // home team index
+  int team2[ngames];               // away team index
+  int score1[ngames];              // score home team
+  int score2[ngames];              // score away team
+  int seasons;                     // number of seasons
+  int time[seasons];
+  int timetrack[ngames];
+}
+
+parameters {
+  matrix[seasons, nteams] att_raw; // raw attack ability, aggiungi una stagione
+  matrix[seasons, nteams] def_raw; // raw defense ability, aggiungi una stagione
+  real home;
+  real<lower=0> sigma_att;          // Matern 3/2 kernel parameter for attack
+  real<lower=0> length_scale_att;   // Matern 3/2 kernel parameter for attack
+  real<lower=0> sigma_def;          // Matern 3/2 kernel parameter for defense
+  real<lower=0> length_scale_def;   // Matern 3/2 kernel parameter for defense
+}
+
+transformed parameters {
+  matrix[seasons, nteams] att;     // attack abilities
+  matrix[seasons, nteams] def;     // defense abilities
+  cov_matrix[seasons] Sigma_att;   // GP attack cov. funct.   
+  cov_matrix[seasons] Sigma_def;   // GP defense cov.funct.
+  vector[ngames] theta_home;       // exponentiated linear pred.
+  vector[ngames] theta_away;
+
+  // Nuova matrice di covarianza Matérn 3/2
+  for (i in 1:seasons + 1) {
+    for (j in 1:seasons + 1) {
+      Sigma_att[i, j] = sigma_att^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_att) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_att);
+      Sigma_def[i, j] = sigma_def^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / length_scale_def) * exp(-sqrt(3) * abs(time[i] - time[j]) / length_scale_def);
+    }
+  }
+
+  // Sum-to-zero                          
+  att[1] = att_raw[1] - mean(att_raw[1]); 
+  def[1] = def_raw[1] - mean(def_raw[1]);
+  for (t in 2:seasons) {
+    att[t] = att_raw[t] - mean(att_raw[t]);
+    def[t] = def_raw[t] - mean(def_raw[t]);
+  }
+
+  for (n in 1:ngames) {
+    theta_home[n] = exp(home + att[timetrack[n], team1[n]] - def[timetrack[n], team2[n]]);
+    theta_away[n] = exp(att[timetrack[n], team2[n]] - def[timetrack[n], team1[n]]);
+  }
+}
+
+model {
+  // priors for team abilities                             
+  for (h in 1:nteams) {
+    att_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_att);  
+    def_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_def);
+  }
+
+  // priors fixed effects
+  home ~ normal(0, 5);
+  sigma_att ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for attack
+  length_scale_att ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for attack
+  sigma_def ~ gamma(2, 0.1);                // Prior for Matern 3/2 kernel parameter for defense
+  length_scale_def ~ gamma(2, 0.1);         // Prior for Matern 3/2 kernel parameter for defense
+
+  // New observations for season 2022
+  for (h in 1:nteams) {
+    att_raw[seasons, h] ~ multi_normal(att_raw[seasons, h], Sigma_att);  
+    def_raw[seasons, h] ~ multi_normal(def_raw[seasons, h], Sigma_def);
+  }
+
+  // likelihood
+  score1 ~ poisson(theta_home);
+  score2 ~ poisson(theta_away);
+}
+
+"
+```
+
+
+GP CON MATERN FUNCTION    no prior on scale and sigma
+```{r}
+gp_matern_2 <- "
+
+data {
+  int nteams;                     // number of teams
+  int ngames;                     // number of games
+  int team1[ngames];               // home team index
+  int team2[ngames];               // away team index
+  int score1[ngames];              // score home team
+  int score2[ngames];              // score away team
+  int seasons;                     // number of seasons
+  int time[seasons];
+  int timetrack[ngames];
+}
+
+parameters {
+  matrix[seasons, nteams] att_raw; // raw attack ability
+  matrix[seasons, nteams] def_raw; // raw defense ability
+  real home;
+  //real<lower=0> sig_att;          // Matern 3/2 kernel parameter for attack
+  //real<lower=0> length_scale_att;   // Matern 3/2 kernel parameter for attack
+  //real<lower=0> sig_def;          // Matern 3/2 kernel parameter for defense
+  //real<lower=0> length_scale_def;   // Matern 3/2 kernel parameter for defense
+}
+
+transformed parameters {
+  matrix[seasons, nteams] att;     // attack abilities
+  matrix[seasons, nteams] def;     // defense abilities
+  cov_matrix[seasons] Sigma_att;   // GP attack cov. funct.   
+  cov_matrix[seasons] Sigma_def;   // GP defense cov.funct.
+  vector[ngames] theta_home;       // exponentiated linear pred.
+  vector[ngames] theta_away;
+
+  // Nuova matrice di covarianza Matérn 3/2
+  for (i in 1:seasons) {
+    for (j in 1:seasons) {
+      Sigma_att[i, j] = 20^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / 20) * exp(-sqrt(3) * abs(time[i] - time[j]) / 20);
+      Sigma_def[i, j] = 20^2 * (1 + sqrt(3) * abs(time[i] - time[j]) / 20) * exp(-sqrt(3) * abs(time[i] - time[j]) / 20);
+    }
+  }
+
+  // Sum-to-zero                          
+  att[1] = att_raw[1] - mean(att_raw[1]); 
+  def[1] = def_raw[1] - mean(def_raw[1]);
+  for (t in 2:seasons) {
+    att[t] = att_raw[t] - mean(att_raw[t]);
+    def[t] = def_raw[t] - mean(def_raw[t]);
+  }
+
+  for (n in 1:ngames) {
+    theta_home[n] = exp(home + att[timetrack[n], team1[n]] + def[timetrack[n], team2[n]]);
+    theta_away[n] = exp(att[timetrack[n], team2[n]] + def[timetrack[n], team1[n]]);
+  }
+}
+
+model {
+  // priors for team abilities                             
+  for (h in 1:nteams) {
+    att_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_att);  
+    def_raw[, h] ~ multi_normal(rep_vector(0, seasons), Sigma_def);
+  }
+
+  // priors fixed effects
+  home ~ normal(0, 5);
+  //sig_att ~ gamma(2, 0.5);                // Prior for Matern 3/2 kernel parameter for attack
+  //length_scale_att ~ gamma(2, 1);         // Prior for Matern 3/2 kernel parameter for attack
+  //sig_def ~ gamma(2, 0.5);                // Prior for Matern 3/2 kernel parameter for defense
+  //length_scale_def ~ gamma(2, 1);         // Prior for Matern 3/2 kernel parameter for defense
+
+  // likelihood
+  score1 ~ poisson(theta_home);
+  score2 ~ poisson(theta_away);
+}
+
+"
+```
+
+
+```{r}
+writeLines(gp_matern_neg, "gp_matern_neg.stan")
+first_model = stan(file ="gp_matern_neg.stan",  data = up_data, verbose = FALSE)
+```
+
+ù
+```{r}
+summary(model_param)
+```
+
+
+
+Model parameters extraction
+
+```{r}
+model_param = rstan::extract(first_model)
+```
+
+
+############################## 
+
+
+
+
+```{r}
+num_plots <- 34
+
+# Ciclo per generare e salvare tutti i plot
+for (i in 1:num_plots) {
+  GP_Data <- model_param$att[,,i]
+  
+  team_name <- up_data$teams[i]
+  
+  # Plot delle linee grigie
+  matplot(t(GP_Data), type = "l", col = "gray", lty = 1, xlab = "Season", ylab = "Values", main = paste("Latent Attack values |", team_name), axes = FALSE)
+  
+  # Calcola e aggiungi una linea media in rosso
+  media_colonne <- colMeans(GP_Data)
+  lines(media_colonne, col = "turquoise", lwd = 2)
+  
+  # Aggiungi i punti della media come pallini neri
+  points(media_colonne, col = "black", pch = 16)
+  
+  axis(1, at = 1:9, labels = c("2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021"))
+  axis(2) 
+  
+  # Aggiungi griglia
+  grid()
+}
+
+```
+
+
+
+
+```{r}
+num_plots <- 34
+
+# Ciclo per generare e salvare tutti i plot
+for (i in 1:num_plots) {
+  GP_Data <- model_param$def[,,i]
+  
+  team_name <- up_data$teams[i]
+  
+  # Plot delle linee grigie
+  matplot(t(GP_Data), type = "l", col = "gray", lty = 1, xlab = "Season", ylab = "Values", main = paste("Latent Defense values |", team_name), axes = FALSE)
+  
+  # Calcola e aggiungi una linea media in rosso
+  media_colonne <- colMeans(GP_Data)
+  lines(media_colonne, col = "turquoise", lwd = 2)
+  
+  # Aggiungi i punti della media come pallini neri
+  points(media_colonne, col = "black", pch = 16)
+  
+  axis(1, at = 1:9, labels = c("2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021"))
+  axis(2)  # Aggiungi l'asse Y con i valori predefiniti
+  
+  # Aggiungi griglia
+  grid()
+}
+
+
+```
+
+
+
+
+
+HO GLI INDICI UNIVOCI PER OGNI SQUADRA DA 1 A 34
+
+```{r}
+team_indices <- match(up_data$teams, unique(up_data$teams))
+up_data$teams[1]
+
+for (i in seq_along(up_data$teams)) {
+  cat("squadra:", up_data$teams[i], " - ", team_indices[i], "\n")
+}
+```
+
+```{r}
+# media e deviazione standard (calcolate sulle 4000 iterazioni) per ogni squadra (att e def) in ogni stagione. 
+media_per_stagione_att <- apply(model_param$att, MARGIN = c(2, 3), mean)
+sd_per_stagione_att <- apply(model_param$att, MARGIN = c(2, 3), sd)
+
+media_per_stagione_def <- apply(model_param$def, MARGIN = c(2, 3), mean)
+sd_per_stagione_def <- apply(model_param$def, MARGIN = c(2, 3), sd)
+```
+
+```{r}
+
+# Creazione di un dataframe per le capacità di attacco senza la colonna "Stagione"
+df_att <- setNames(
+  data.frame(
+    media_per_stagione_att,
+    check.names = FALSE
+  ),
+  paste0(team_indices, "-", up_data$teams)
+)
+
+# Creazione di un dataframe per le capacità di difesa senza la colonna "Stagione"
+df_def <- setNames(
+  data.frame(
+    media_per_stagione_def,
+    check.names = FALSE
+  ),
+  paste0(team_indices, "-", up_data$teams)
+)
+
+# Creazione di un dataframe per le deviazioni standard di attacco senza la colonna "Stagione"
+df_sd_att <- setNames(
+  data.frame(
+    sd_per_stagione_att,
+    check.names = FALSE
+  ),
+  paste0(team_indices, "-", up_data$teams)
+)
+
+# Creazione di un dataframe per le deviazioni standard di difesa senza la colonna "Stagione"
+df_sd_def <- setNames(
+  data.frame(
+    sd_per_stagione_def,
+    check.names = FALSE
+  ),
+  paste0(team_indices, "-", up_data$teams)
+)
+
+
+# Visualizza i primi 6 record del dataframe
+df_att
+df_def
+df_sd_att
+df_sd_def
+
+```
+
+
+
+FILTRARE TUTTE LE STAGIONI PER SQUADRE PRESENTI SOLO NELL'ULTIMA
+
+```{r}
+unique_ss <- unique(subset(italy_13_to_21$home, italy_13_to_21$season == "2021"))    #TO CHANGE DEPENDING ON SEASON
+indici_20_teams_ss <- match(unique_ss, up_data$teams)
+indici_20_teams_ss
+```
+
+DF FINALI SOLO CON SQUADRE DELLA STAGIONE D'INTERESSE MA CON TUTTI I VALORI DELLE STAGIONI CONSIDERATE
+
+```{r}
+df_att_ss <- df_att[, team_indices %in% indici_20_teams_ss, drop = FALSE]
+df_sd_att_ss <- df_sd_att[, team_indices %in% indici_20_teams_ss, drop = FALSE]
+df_def_ss <- df_def[, team_indices %in% indici_20_teams_ss, drop = FALSE]
+df_sd_def_ss <- df_sd_def[, team_indices %in% indici_20_teams_ss, drop = FALSE]
+```
+
+PLOT FINALE SOLO CON SINGOLA SQUADRA
+
+
+
+
+
+DF FINALI SOLO CON SQUADRE STAGIONE D'INTERESSE E CON VALORI DELLA STAGIONE D'INTERESSE
+
+```{r}
+df_att_ss_final <- df_att_ss[nrow(df_att_ss), ]
+df_sd_att_ss_final <- df_sd_att_ss[nrow(df_sd_att_ss), ]
+df_def_ss_final <- df_def_ss[nrow(df_def_ss), ]
+df_sd_def_ss_final <- df_sd_def_ss[nrow(df_sd_def_ss), ]
+
+df_att_ss_final
+df_sd_att_ss_final
+df_def_ss_final 
+df_sd_def_ss_final 
+```
+
+```{r}
+library(ggplot2)
+
+# I tuoi dati
+valori_attacco <- unlist(df_att_ss_final)
+sd_attacco <- unlist(df_sd_att_ss_final)
+valori_difesa <- unlist(df_def_ss_final)
+sd_difesa <- unlist(df_sd_def_ss_final)
+nomi_squadre <- colnames(df_att_ss_final)
+nomi_squadre <- gsub("\\d+-", "", nomi_squadre)
+
+
+
+data <- data.frame(
+  Attack = valori_attacco,
+  Defense = valori_difesa,
+  SD_Attack = sd_attacco,
+  SD_Defense = sd_difesa,
+  Team = nomi_squadre
+)
+print(data)
+
+```
+
+
+
+
+```{r}
+attach(data)
+
+
+k <- 4
+
+# Perform K-means clustering
+set.seed(123)  # Set seed for reproducibility
+data$cluster <- kmeans(data[, c("Defense", "Attack")], centers = k)$cluster
+
+# Create a ggplot scatter plot
+p <- ggplot(data, aes(x = Defense, y = Attack, label = Team, color = factor(cluster))) +
+  labs(x = "Defense", y = "Attack", title = "Attack & Defense") +
+  
+  # Add arrows for standard deviations
+  geom_errorbar(aes(x = Defense, ymin = Attack - SD_Attack, ymax = Attack + SD_Attack), width = 0, linetype = "dashed", color = "darkgrey", alpha = 0.8) +
+  geom_errorbarh(aes(y = Attack, xmin = Defense - SD_Defense, xmax = Defense + SD_Defense), height = 0, linetype = "dashed", color = "darkgrey", alpha = 0.8) +
+  # Add labels with repel to avoid overlapping
+  geom_text_repel(aes(color = factor(cluster)), box.padding = 0.68, size = 3, max.overlaps = Inf, color = "black") +
+  geom_point(size = 3.5, alpha = 0.7) +
+
+  # Set theme with a white background
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white")
+  ) +
+  
+  # Add cluster colors and change the legend title
+  scale_color_manual(name = "Cluster", values = c("red", "blue", "green", "orange")) +
+  
+  # Add dashed line at x = 0.5 and y = 0.5
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  
+  # Set X and Y axis limits
+  xlim(-0.5, 0.8) +
+  ylim(-0.5, 0.8)
+# Visualizza il grafico
+print(p)
+
+ggsave("C:/Users/kecco/Desktop/TESI_magistrale/images_thesis/GP_final_plot_2021_1.png", width = 8, height = 6, dpi = 300)
+
+```
+
+
+```{r}
+# Trova le righe con valori mancanti nelle colonne utilizzate per geom_errorbarh
+righe_mancanti_errorbarh <- data[is.na(data$Defense) | is.na(data$SD_Defense), ]
+
+# Stampa le righe con valori mancanti
+print(righe_mancanti_errorbarh)
+
+```
+
+
+
+DISTANCES
+
+```{r}
+
+# Euclidean: radice quadrata della somma dei quadrati delle differenze tra le coordinate dei punti
+euclidean_distance <- sqrt(valori_attacco^2 + valori_difesa^2)
+
+# Creazione del dataframe
+distance_euc <- data.frame(
+  Team = nomi_squadre,
+  Euclidean = euclidean_distance
+)
+
+distance_euc <- arrange(distance_euc, desc(Euclidean))
+
+
+```
